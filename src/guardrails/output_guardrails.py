@@ -37,20 +37,12 @@ def content_filter(response: str) -> dict:
         dict with 'safe', 'issues', and 'redacted' keys
     """
     issues = []
-    redacted = response
+    redacted = response or ""
 
-    # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
-    }
-
-    for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+    # Order matters: specific secrets first so generic PII rules do not
+    # split them into partially-redacted fragments.
+    for name, pattern in _all_patterns().items():
+        matches = re.findall(pattern, redacted, re.IGNORECASE)
         if matches:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
@@ -60,6 +52,40 @@ def content_filter(response: str) -> dict:
         "issues": issues,
         "redacted": redacted,
     }
+
+
+SECRET_PATTERNS = {
+    "api_key": r"\bsk-[A-Za-z0-9_-]{6,}",
+    "password": r"\b(?:password|passwd|pwd|mật\s*khẩu)\s*(?:is|là|:|=)\s*\S+",
+    "internal_host": r"\b[\w.-]+\.internal(?::\d+)?\b",
+}
+
+PII_PATTERNS = {
+    "email": r"[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[a-zA-Z]{2,}",
+    "vn_phone": r"(?<!\d)(?:\+84|84|0)(?:[\s.-]?\d){9,10}(?!\d)",
+    "national_id": r"(?<!\d)(?:\d{12}|\d{9})(?!\d)",
+}
+
+# Issue names that mean a protected secret (not just customer PII) was emitted
+SECRET_ISSUES = frozenset({"known_secret", *SECRET_PATTERNS})
+
+
+def _all_patterns() -> dict:
+    from core.config import DEMO_SECRETS
+
+    patterns = {}
+    known = [s for s in DEMO_SECRETS if s]
+    if known:
+        patterns["known_secret"] = "|".join(
+            re.escape(s) for s in sorted(known, key=len, reverse=True)
+        )
+    patterns.update(SECRET_PATTERNS)
+    patterns.update(PII_PATTERNS)
+    return patterns
+
+
+def has_secret_issue(issues: list[str]) -> bool:
+    return any(issue.split(":", 1)[0] in SECRET_ISSUES for issue in issues)
 
 
 # ============================================================
@@ -149,6 +175,8 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         self.blocked_count = 0
         self.redacted_count = 0
         self.total_count = 0
+        self.last_action: str | None = None
+        self.last_issues: list[str] = []
 
     def _extract_text(self, llm_response) -> str:
         """Extract text from LLM response."""
@@ -172,16 +200,40 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        self.last_action = None
+        result = content_filter(response_text)
+        if not result["safe"]:
+            self.redacted_count += 1
+            self.last_issues = result["issues"]
+            if has_secret_issue(result["issues"]):
+                # Protected data in the reply → fail closed, drop the whole answer
+                self.blocked_count += 1
+                self.last_action = "blocked"
+                llm_response.content = self._as_content(SAFE_REFUSAL)
+                return llm_response
+            # Customer PII only → keep the answer, mask the PII
+            self.last_action = "redacted"
+            llm_response.content = self._as_content(result["redacted"])
+            response_text = result["redacted"]
 
-        return llm_response  # TODO: modify if needed
+        if self.use_llm_judge:
+            verdict = await llm_safety_check(response_text)
+            if not verdict["safe"]:
+                self.blocked_count += 1
+                self.last_action = "blocked"
+                llm_response.content = self._as_content(SAFE_REFUSAL)
+
+        return llm_response
+
+    @staticmethod
+    def _as_content(text: str) -> types.Content:
+        return types.Content(role="model", parts=[types.Part.from_text(text=text)])
+
+
+SAFE_REFUSAL = (
+    "I'm sorry, I can't share internal system details. "
+    "How else can I help with your VinBank account or banking needs?"
+)
 
 
 # ============================================================
